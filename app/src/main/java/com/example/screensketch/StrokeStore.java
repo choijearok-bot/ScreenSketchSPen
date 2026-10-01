@@ -1,13 +1,20 @@
 package com.example.screensketch;
 
+import android.graphics.Canvas;
+import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.PointF;
 import android.graphics.RectF;
+
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 
 public final class StrokeStore {
+    private static final StrokeStore INSTANCE = new StrokeStore();
+
+    public static StrokeStore get() { return INSTANCE; }
+
     public static final class Stroke {
         public final Path path = new Path();
         public float width;
@@ -68,6 +75,8 @@ public final class StrokeStore {
     private final List<Stroke> strokes = new ArrayList<>();
     private final List<Stroke> redo = new ArrayList<>();
 
+    private StrokeStore() {}
+
     public synchronized Stroke addStroke(float width, int color, int alpha, String type) {
         Stroke s = new Stroke(width, color, alpha, type);
         strokes.add(s);
@@ -114,6 +123,25 @@ public final class StrokeStore {
             redo.addAll(strokes);
             strokes.clear();
         }
+    }
+
+    public synchronized boolean isEmpty() { return strokes.isEmpty(); }
+
+    public synchronized void drawTo(Canvas canvas, float scaleX, float scaleY) {
+        Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeCap(Paint.Cap.ROUND);
+        paint.setStrokeJoin(Paint.Join.ROUND);
+
+        canvas.save();
+        canvas.scale(scaleX, scaleY);
+        for (Stroke s : strokes) {
+            paint.setColor(s.color);
+            paint.setAlpha(s.alpha);
+            paint.setStrokeWidth(s.width);
+            canvas.drawPath(s.path, paint);
+        }
+        canvas.restore();
     }
 
     private static float dist2(float x1,float y1,float x2,float y2){float dx=x1-x2,dy=y1-y2;return dx*dx+dy*dy;}
