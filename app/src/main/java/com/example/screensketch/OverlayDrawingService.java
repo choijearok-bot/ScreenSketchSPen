@@ -52,6 +52,7 @@ public class OverlayDrawingService extends Service {
     private boolean captureHidden = false;
     private boolean toolbarLocked = false;
     private boolean presetVisible = false;
+    private boolean toolbarAttached = false;
 
     private int selectedColor = Color.rgb(244,67,54);
     private int widthDp = 5;
@@ -106,10 +107,16 @@ public class OverlayDrawingService extends Service {
 
         wm = (WindowManager) getSystemService(WINDOW_SERVICE);
         addDisplayWindow();
-        addInputWindow();
         buildToolbar();
-        addToolbarWindow(); // Always added LAST so it stays above the drawing input layer.
-        applyDrawingMode();
+
+        // PEN ON/OFF is implemented by physically attaching/removing the full-screen
+        // input overlay. This is more reliable on Samsung/One UI than toggling
+        // FLAG_NOT_TOUCHABLE on an already-attached overlay window.
+        if (drawingEnabled && !addInputWindow(false)) {
+            drawingEnabled = false;
+            savePreferences();
+        }
+        addToolbarWindow(); // Must be attached LAST so toolbar always receives touches.
         applyCollapsed();
         updateToolbarState();
     }
@@ -231,69 +238,127 @@ public class OverlayDrawingService extends Service {
         wm.addView(displayView, displayParams);
     }
 
-    private void addInputWindow() {
-        inputView = new DrawingInputView(this, store, displayView);
-        inputView.setEraserStateListener(active -> {
+    /**
+     * Attach the full-screen input overlay. When the toolbar is already attached,
+     * it is briefly detached and reattached after the input window so the toolbar
+     * remains the top-most touch target.
+     */
+    private boolean addInputWindow(boolean keepToolbarOnTop) {
+        if (wm == null) return false;
+        if (inputView != null) return true;
+
+        boolean reattachToolbar = keepToolbarOnTop && toolbarAttached && toolbar != null;
+        if (reattachToolbar) removeToolbarWindowOnly();
+
+        DrawingInputView candidate = new DrawingInputView(this, store, displayView);
+        candidate.setEraserStateListener(active -> {
             eraserActive = active;
             updateToolbarState();
         });
-        applyToolSettings();
 
-        inputParams = new WindowManager.LayoutParams(
+        WindowManager.LayoutParams params = new WindowManager.LayoutParams(
                 WindowManager.LayoutParams.MATCH_PARENT,
                 WindowManager.LayoutParams.MATCH_PARENT,
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                         | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                 PixelFormat.TRANSLUCENT);
-        inputParams.gravity = Gravity.TOP | Gravity.START;
-        // This window draws nothing; low alpha keeps touch-through safe when PEN is OFF.
-        inputParams.alpha = 0.01f;
-        wm.addView(inputView, inputParams);
+        params.gravity = Gravity.TOP | Gravity.START;
+
+        // The view itself is transparent. Keep window alpha at 1.0 while PEN is ON
+        // so Samsung/One UI does not treat it as an almost-invisible pass-through
+        // overlay. PEN OFF removes this window completely.
+        params.alpha = 1.0f;
+
+        try {
+            wm.addView(candidate, params);
+            inputView = candidate;
+            inputParams = params;
+            applyToolSettings();
+        } catch (Exception e) {
+            inputView = null;
+            inputParams = null;
+            if (reattachToolbar) addToolbarWindow();
+            Toast.makeText(this, "펜 입력창을 열지 못했습니다: " + e.getClass().getSimpleName(), Toast.LENGTH_LONG).show();
+            return false;
+        }
+
+        if (reattachToolbar) {
+            addToolbarWindow();
+            if (!toolbarAttached) {
+                // Never leave a full-screen input window above a missing toolbar.
+                removeInputWindow();
+                Toast.makeText(this, "툴바 복원 실패 · 안전을 위해 PEN OFF로 전환했습니다.", Toast.LENGTH_LONG).show();
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private void removeInputWindow() {
+        if (inputView != null && wm != null) {
+            try { wm.removeViewImmediate(inputView); } catch (Exception ignored) {}
+        }
+        inputView = null;
+        inputParams = null;
+        eraserActive = false;
     }
 
     private void addToolbarWindow() {
-        toolbarParams = new WindowManager.LayoutParams(
-                dp(TOOLBAR_EXPANDED_WIDTH_DP),
-                WindowManager.LayoutParams.WRAP_CONTENT,
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                        | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
-                PixelFormat.TRANSLUCENT);
-        toolbarParams.gravity = Gravity.TOP | Gravity.START;
+        if (toolbar == null || wm == null || toolbarAttached) return;
+        if (toolbarParams == null) {
+            toolbarParams = new WindowManager.LayoutParams(
+                    dp(collapsed ? TOOLBAR_COLLAPSED_WIDTH_DP : TOOLBAR_EXPANDED_WIDTH_DP),
+                    WindowManager.LayoutParams.WRAP_CONTENT,
+                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                            | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                    PixelFormat.TRANSLUCENT);
+            toolbarParams.gravity = Gravity.TOP | Gravity.START;
+        }
+        toolbarParams.width = dp(collapsed ? TOOLBAR_COLLAPSED_WIDTH_DP : TOOLBAR_EXPANDED_WIDTH_DP);
+        toolbarParams.height = WindowManager.LayoutParams.WRAP_CONTENT;
         toolbarParams.x = toolbarX;
         toolbarParams.y = toolbarY;
-        wm.addView(toolbar, toolbarParams);
-        toolbar.post(this::clampToolbarToScreen);
+        try {
+            wm.addView(toolbar, toolbarParams);
+            toolbarAttached = true;
+            toolbar.post(this::clampToolbarToScreen);
+        } catch (Exception ignored) {
+            toolbarAttached = false;
+        }
+    }
+
+    private void removeToolbarWindowOnly() {
+        if (toolbarAttached && toolbar != null && wm != null) {
+            try { wm.removeViewImmediate(toolbar); } catch (Exception ignored) {}
+        }
+        toolbarAttached = false;
     }
 
     private void setDrawingEnabled(boolean enabled) {
         if (captureHidden) return;
-        drawingEnabled = enabled;
-        eraserActive = false;
         hidePalette();
         hidePresetPanel();
-        applyDrawingMode();
+        eraserActive = false;
+
+        if (enabled) {
+            boolean ok = addInputWindow(true);
+            drawingEnabled = ok;
+            if (!ok) {
+                Toast.makeText(this, "PEN ON 전환 실패 · 화면 위 표시 권한을 확인해 주세요.", Toast.LENGTH_LONG).show();
+            }
+        } else {
+            removeInputWindow();
+            drawingEnabled = false;
+        }
+
         savePreferences();
         updateToolbarState();
+        refreshNotification();
         Toast.makeText(this,
-                enabled ? "펜 입력 ON · 그리기 가능" : "펜 입력 OFF · 아래 화면 조작 가능",
+                drawingEnabled ? "펜 입력 ON · 그리기 가능" : "펜 입력 OFF · 아래 화면 조작 가능",
                 Toast.LENGTH_SHORT).show();
-    }
-
-    private void applyDrawingMode() {
-        if (inputView == null || inputParams == null || wm == null) return;
-        int flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN;
-        if (!drawingEnabled || captureHidden) {
-            flags |= WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                    | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL;
-        }
-        inputParams.flags = flags;
-        inputParams.alpha = 0.01f;
-        inputView.setEnabled(drawingEnabled && !captureHidden);
-        inputView.setVisibility(captureHidden ? View.INVISIBLE : View.VISIBLE);
-        try { wm.updateViewLayout(inputView, inputParams); } catch (Exception ignored) {}
     }
 
     private TextView b(String text) {
@@ -812,11 +877,28 @@ public class OverlayDrawingService extends Service {
     }
 
     private void setCaptureHidden(boolean hidden) {
+        if (captureHidden == hidden) return;
         captureHidden = hidden;
-        if (displayView != null) displayView.setVisibility(hidden ? View.INVISIBLE : View.VISIBLE);
-        if (toolbar != null) toolbar.setVisibility(hidden ? View.INVISIBLE : View.VISIBLE);
-        applyDrawingMode();
-        if (!hidden && displayView != null) displayView.invalidate();
+
+        if (hidden) {
+            // No invisible full-screen touch window is left behind during capture.
+            removeInputWindow();
+            if (displayView != null) displayView.setVisibility(View.INVISIBLE);
+            if (toolbar != null) toolbar.setVisibility(View.INVISIBLE);
+        } else {
+            if (displayView != null) {
+                displayView.setVisibility(View.VISIBLE);
+                displayView.invalidate();
+            }
+            if (toolbar != null) toolbar.setVisibility(View.VISIBLE);
+            if (drawingEnabled) {
+                if (!addInputWindow(true)) {
+                    drawingEnabled = false;
+                    savePreferences();
+                    updateToolbarState();
+                }
+            }
+        }
     }
 
     private int contrast(int color) {
@@ -854,7 +936,7 @@ public class OverlayDrawingService extends Service {
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
 
         return new Notification.Builder(this, "screen_sketch")
-                .setContentTitle("Screen Sketch S Pen v1.5.1")
+                .setContentTitle("Screen Sketch S Pen v1.5.2")
                 .setContentText((drawingEnabled ? "PEN ON" : "PEN OFF") + " · 자동저장/복구 · WORK · LASSO")
                 .setSmallIcon(R.drawable.ic_pen)
                 .setContentIntent(op)
@@ -879,8 +961,8 @@ public class OverlayDrawingService extends Service {
         hidePalette();
         hidePresetPanel();
         if (wm != null) {
-            if (toolbar != null) try { wm.removeView(toolbar); } catch (Exception ignored) {}
-            if (inputView != null) try { wm.removeView(inputView); } catch (Exception ignored) {}
+            removeInputWindow();
+            removeToolbarWindowOnly();
             if (displayView != null) try { wm.removeView(displayView); } catch (Exception ignored) {}
         }
         super.onDestroy();

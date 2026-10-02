@@ -3,6 +3,7 @@ package com.example.screensketch;
 import android.content.Context;
 import android.graphics.Color;
 import android.graphics.RectF;
+import android.view.InputDevice;
 import android.view.MotionEvent;
 import android.view.View;
 
@@ -34,6 +35,10 @@ public class DrawingInputView extends View {
         float d=getResources().getDisplayMetrics().density;
         currentWidth=5.5f*d; eraserRadius=18f*d;
         setBackgroundColor(Color.TRANSPARENT);
+        // Explicitly clickable so this full-screen overlay consistently becomes
+        // the touch target when it is attached in PEN ON mode.
+        setClickable(true);
+        setFocusable(false);
     }
 
     public void setPenColor(int color){currentColor=color;}
@@ -46,7 +51,14 @@ public class DrawingInputView extends View {
 
     private void setEraserActive(boolean active){if(eraserActive==active)return;eraserActive=active;if(eraserStateListener!=null)eraserStateListener.onEraserStateChanged(active);}
     private boolean buttonPressed(MotionEvent e){int b=e.getButtonState();return (b&MotionEvent.BUTTON_STYLUS_PRIMARY)!=0||(b&MotionEvent.BUTTON_STYLUS_SECONDARY)!=0;}
-    private boolean isStylus(MotionEvent e,int i){int t=e.getToolType(i);return t==MotionEvent.TOOL_TYPE_STYLUS||t==MotionEvent.TOOL_TYPE_ERASER;}
+    private boolean isStylus(MotionEvent e,int i){
+        int t=e.getToolType(i);
+        if(t==MotionEvent.TOOL_TYPE_STYLUS||t==MotionEvent.TOOL_TYPE_ERASER)return true;
+        // Samsung/One UI can occasionally preserve SOURCE_STYLUS while reporting
+        // a less specific tool type through an overlay window. Accept the source
+        // as a fallback so genuine S Pen input is not discarded.
+        return (e.getSource() & InputDevice.SOURCE_STYLUS) == InputDevice.SOURCE_STYLUS;
+    }
     private boolean isErase(MotionEvent e,int i){return tool==Tool.ERASER||e.getToolType(i)==MotionEvent.TOOL_TYPE_ERASER||buttonPressed(e);}
     private boolean isShape(){return tool==Tool.LINE||tool==Tool.ARROW||tool==Tool.RECT||tool==Tool.ELLIPSE;}
     private String shapeType(){switch(tool){case ARROW:return"ARROW";case RECT:return"RECT";case ELLIPSE:return"ELLIPSE";default:return"LINE";}}
@@ -128,7 +140,7 @@ public class DrawingInputView extends View {
     }
 
     @Override public boolean onGenericMotionEvent(MotionEvent e){
-        if(e.getPointerCount()>0&&e.getToolType(0)==MotionEvent.TOOL_TYPE_STYLUS){
+        if(e.getPointerCount()>0&&isStylus(e,0)){
             if(e.getActionMasked()==MotionEvent.ACTION_BUTTON_PRESS)setEraserActive(true);
             else if(e.getActionMasked()==MotionEvent.ACTION_BUTTON_RELEASE)setEraserActive(false);
         }
