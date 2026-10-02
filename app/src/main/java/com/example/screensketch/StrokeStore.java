@@ -1,17 +1,28 @@
 package com.example.screensketch;
 
+import android.content.Context;
 import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.PointF;
 import android.graphics.RectF;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 
 public final class StrokeStore {
     private static final StrokeStore INSTANCE = new StrokeStore();
+    private static final String SAVE_FILE = "drawing_session_v14.json";
 
     public static StrokeStore get() { return INSTANCE; }
 
@@ -74,8 +85,17 @@ public final class StrokeStore {
 
     private final List<Stroke> strokes = new ArrayList<>();
     private final List<Stroke> redo = new ArrayList<>();
+    private File saveFile;
+    private boolean initialized;
 
     private StrokeStore() {}
+
+    public synchronized void init(Context context) {
+        if (initialized) return;
+        saveFile = new File(context.getApplicationContext().getFilesDir(), SAVE_FILE);
+        loadLocked();
+        initialized = true;
+    }
 
     public synchronized Stroke addStroke(float width, int color, int alpha, String type) {
         Stroke s = new Stroke(width, color, alpha, type);
@@ -110,11 +130,17 @@ public final class StrokeStore {
     }
 
     public synchronized void undo() {
-        if (!strokes.isEmpty()) redo.add(strokes.remove(strokes.size() - 1));
+        if (!strokes.isEmpty()) {
+            redo.add(strokes.remove(strokes.size() - 1));
+            saveLocked();
+        }
     }
 
     public synchronized void redo() {
-        if (!redo.isEmpty()) strokes.add(redo.remove(redo.size() - 1));
+        if (!redo.isEmpty()) {
+            strokes.add(redo.remove(redo.size() - 1));
+            saveLocked();
+        }
     }
 
     public synchronized void clear() {
@@ -122,8 +148,11 @@ public final class StrokeStore {
             redo.clear();
             redo.addAll(strokes);
             strokes.clear();
+            saveLocked();
         }
     }
+
+    public synchronized void save() { saveLocked(); }
 
     public synchronized boolean isEmpty() { return strokes.isEmpty(); }
 
@@ -142,6 +171,97 @@ public final class StrokeStore {
             canvas.drawPath(s.path, paint);
         }
         canvas.restore();
+    }
+
+    private void saveLocked() {
+        if (!initialized || saveFile == null) return;
+        try {
+            JSONObject root = new JSONObject();
+            root.put("version", 1);
+            JSONArray list = new JSONArray();
+            for (Stroke s : strokes) {
+                JSONObject o = new JSONObject();
+                o.put("width", s.width);
+                o.put("color", s.color);
+                o.put("alpha", s.alpha);
+                o.put("type", s.type);
+                o.put("sx", s.startX);
+                o.put("sy", s.startY);
+                o.put("ex", s.endX);
+                o.put("ey", s.endY);
+                JSONArray pts = new JSONArray();
+                for (PointF p : s.points) {
+                    JSONArray pt = new JSONArray();
+                    pt.put(p.x); pt.put(p.y);
+                    pts.put(pt);
+                }
+                o.put("points", pts);
+                list.put(o);
+            }
+            root.put("strokes", list);
+
+            File tmp = new File(saveFile.getParentFile(), SAVE_FILE + ".tmp");
+            try (FileOutputStream out = new FileOutputStream(tmp, false)) {
+                out.write(root.toString().getBytes(StandardCharsets.UTF_8));
+                out.getFD().sync();
+            }
+            if (saveFile.exists() && !saveFile.delete()) {
+                // Best effort: overwrite on next save if replacement cannot happen now.
+            }
+            if (!tmp.renameTo(saveFile)) {
+                try (FileOutputStream out = new FileOutputStream(saveFile, false)) {
+                    out.write(root.toString().getBytes(StandardCharsets.UTF_8));
+                }
+                //noinspection ResultOfMethodCallIgnored
+                tmp.delete();
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void loadLocked() {
+        strokes.clear();
+        redo.clear();
+        if (saveFile == null || !saveFile.exists()) return;
+        try {
+            StringBuilder sb = new StringBuilder();
+            try (BufferedReader r = new BufferedReader(new InputStreamReader(
+                    new FileInputStream(saveFile), StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = r.readLine()) != null) sb.append(line);
+            }
+            JSONObject root = new JSONObject(sb.toString());
+            JSONArray list = root.optJSONArray("strokes");
+            if (list == null) return;
+            for (int i = 0; i < list.length(); i++) {
+                JSONObject o = list.getJSONObject(i);
+                Stroke s = new Stroke(
+                        (float)o.optDouble("width", 5f),
+                        o.optInt("color", 0xffff0000),
+                        o.optInt("alpha", 255),
+                        o.optString("type", "FREE"));
+                if ("FREE".equals(s.type)) {
+                    JSONArray pts = o.optJSONArray("points");
+                    if (pts != null) {
+                        for (int p = 0; p < pts.length(); p++) {
+                            JSONArray pt = pts.getJSONArray(p);
+                            s.addPoint((float)pt.getDouble(0), (float)pt.getDouble(1), p == 0);
+                        }
+                    }
+                    if (s.points.isEmpty()) continue;
+                } else {
+                    float sx = (float)o.optDouble("sx", 0);
+                    float sy = (float)o.optDouble("sy", 0);
+                    float ex = (float)o.optDouble("ex", sx);
+                    float ey = (float)o.optDouble("ey", sy);
+                    s.rebuildShape(sx, sy, ex, ey);
+                }
+                strokes.add(s);
+            }
+        } catch (Exception ignored) {
+            strokes.clear();
+            redo.clear();
+        }
     }
 
     private static float dist2(float x1,float y1,float x2,float y2){float dx=x1-x2,dy=y1-y2;return dx*dx+dy*dy;}

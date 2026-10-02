@@ -54,7 +54,7 @@ public class DrawingInputView extends View {
         if(!isStylus(e,i)) return true;
         boolean erasing=isErase(e,i);setEraserActive(erasing);
         float x=e.getX(i),y=e.getY(i);
-        if(erasing){current=null;if(e.getActionMasked()==MotionEvent.ACTION_DOWN||e.getActionMasked()==MotionEvent.ACTION_MOVE){if(store.eraseAt(x,y,eraserRadius))displayView.invalidate();}if(e.getActionMasked()==MotionEvent.ACTION_UP||e.getActionMasked()==MotionEvent.ACTION_CANCEL)setEraserActive(false);return true;}
+        if(erasing){current=null;if(e.getActionMasked()==MotionEvent.ACTION_DOWN||e.getActionMasked()==MotionEvent.ACTION_MOVE){if(store.eraseAt(x,y,eraserRadius))displayView.invalidate();}if(e.getActionMasked()==MotionEvent.ACTION_UP||e.getActionMasked()==MotionEvent.ACTION_CANCEL){setEraserActive(false);store.save();}return true;}
         switch(e.getActionMasked()){
             case MotionEvent.ACTION_DOWN:
                 startX=x;startY=y;
@@ -83,7 +83,7 @@ public class DrawingInputView extends View {
             case MotionEvent.ACTION_UP:
             case MotionEvent.ACTION_CANCEL:
                 if(current!=null&&isShape())current.rebuildShape(startX,startY,x,y);
-                current=null;setEraserActive(false);displayView.invalidate();return true;
+                current=null;setEraserActive(false);store.save();displayView.invalidate();return true;
             default:return true;
         }
     }

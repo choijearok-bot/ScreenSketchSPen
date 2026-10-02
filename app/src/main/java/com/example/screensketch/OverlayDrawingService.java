@@ -2,46 +2,47 @@ package com.example.screensketch;
 
 import android.app.*;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.ServiceInfo;
 import android.graphics.Color;
 import android.graphics.PixelFormat;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
 import android.os.IBinder;
+import android.os.SystemClock;
 import android.provider.Settings;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
-import android.view.ViewGroup;
 import android.view.WindowManager;
-import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 
 public class OverlayDrawingService extends Service {
-    public static final String ACTION_CLEAR = "com.example.screensketch.CLEAR";
     public static final String ACTION_STOP = "com.example.screensketch.STOP";
+    public static final String ACTION_TOGGLE = "com.example.screensketch.TOGGLE_DRAW";
     public static final String ACTION_CAPTURE_RESTORE = "com.example.screensketch.CAPTURE_RESTORE";
+
+    private static final String PREFS = "screen_sketch_state_v14";
 
     private WindowManager wm;
     private DrawingDisplayView displayView;
     private DrawingInputView inputView;
-    private FrameLayout interactionRoot;
     private LinearLayout toolbar;
     private LinearLayout paletteView;
 
     private WindowManager.LayoutParams displayParams;
-    private WindowManager.LayoutParams interactionParams;
-    private WindowManager.LayoutParams toolbarWindowParams;
-    private WindowManager.LayoutParams paletteWindowParams;
+    private WindowManager.LayoutParams inputParams;
+    private WindowManager.LayoutParams toolbarParams;
+    private WindowManager.LayoutParams paletteParams;
 
     private final StrokeStore store = StrokeStore.get();
+    private SharedPreferences prefs;
+
     private boolean drawingEnabled = true;
-    private boolean toolbarStandalone = false;
     private boolean collapsed = false;
     private boolean paletteVisible = false;
-    private boolean paletteAsWindow = false;
     private boolean eraserActive = false;
     private boolean captureHidden = false;
 
@@ -57,6 +58,9 @@ public class OverlayDrawingService extends Service {
 
     private int toolbarX, toolbarY;
     private int shapeIndex = 0;
+    private long clearConfirmUntil = 0L;
+    private long exitConfirmUntil = 0L;
+
     private final DrawingInputView.Tool[] shapes = {
             DrawingInputView.Tool.LINE,
             DrawingInputView.Tool.ARROW,
@@ -86,37 +90,76 @@ public class OverlayDrawingService extends Service {
             return;
         }
 
+        store.init(getApplicationContext());
+        prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+        restorePreferences();
+
         wm = (WindowManager) getSystemService(WINDOW_SERVICE);
-        initToolbarPosition();
-        addDisplay();
+        addDisplayWindow();
+        addInputWindow();
         buildToolbar();
-        showDrawingWindow();
+        addToolbarWindow(); // Always added LAST so it stays above the drawing input layer.
+        applyDrawingMode();
+        applyCollapsed();
+        updateToolbarState();
     }
 
     @Override public int onStartCommand(Intent i, int flags, int id) {
         if (i != null) {
             String action = i.getAction();
-            if (ACTION_CLEAR.equals(action)) {
-                store.clear();
-                if (displayView != null) displayView.invalidate();
-            } else if (ACTION_STOP.equals(action)) {
-                stopSelf();
+            if (ACTION_STOP.equals(action)) {
+                requestFullExit();
                 return START_NOT_STICKY;
+            } else if (ACTION_TOGGLE.equals(action)) {
+                setDrawingEnabled(!drawingEnabled);
             } else if (ACTION_CAPTURE_RESTORE.equals(action)) {
                 setCaptureHidden(false);
             }
         }
-        return START_NOT_STICKY;
+        // Keep the foreground drawing toolbar alive even if the launcher activity is closed.
+        // If Android recreates the service, the saved strokes and toolbar state are restored.
+        return START_STICKY;
     }
 
-    private void initToolbarPosition() {
+    private void restorePreferences() {
         int sw = getResources().getDisplayMetrics().widthPixels;
         int sh = getResources().getDisplayMetrics().heightPixels;
-        toolbarX = Math.max(dp(8), sw - dp(76));
-        toolbarY = Math.max(dp(20), sh / 2 - dp(330));
+        int defaultX = Math.max(dp(8), sw - dp(76));
+        int defaultY = Math.max(dp(20), sh / 2 - dp(330));
+
+        drawingEnabled = prefs.getBoolean("drawingEnabled", true);
+        collapsed = prefs.getBoolean("collapsed", false);
+        selectedColor = prefs.getInt("selectedColor", Color.rgb(244,67,54));
+        widthDp = prefs.getInt("widthDp", 5);
+        alphaPct = prefs.getInt("alphaPct", 100);
+        smoothingPct = prefs.getInt("smoothingPct", 45);
+        toolbarX = prefs.getInt("toolbarX", defaultX);
+        toolbarY = prefs.getInt("toolbarY", defaultY);
+
+        int toolOrdinal = prefs.getInt("tool", DrawingInputView.Tool.PEN.ordinal());
+        DrawingInputView.Tool[] values = DrawingInputView.Tool.values();
+        tool = toolOrdinal >= 0 && toolOrdinal < values.length ? values[toolOrdinal] : DrawingInputView.Tool.PEN;
+        for (int i = 0; i < shapes.length; i++) {
+            if (tool == shapes[i]) { shapeIndex = i; break; }
+        }
     }
 
-    private void addDisplay() {
+    private void savePreferences() {
+        if (prefs == null) return;
+        prefs.edit()
+                .putBoolean("drawingEnabled", drawingEnabled)
+                .putBoolean("collapsed", collapsed)
+                .putInt("selectedColor", selectedColor)
+                .putInt("widthDp", widthDp)
+                .putInt("alphaPct", alphaPct)
+                .putInt("smoothingPct", smoothingPct)
+                .putInt("toolbarX", toolbarX)
+                .putInt("toolbarY", toolbarY)
+                .putInt("tool", tool.ordinal())
+                .apply();
+    }
+
+    private void addDisplayWindow() {
         displayView = new DrawingDisplayView(this, store);
         displayParams = new WindowManager.LayoutParams(
                 WindowManager.LayoutParams.MATCH_PARENT,
@@ -127,119 +170,72 @@ public class OverlayDrawingService extends Service {
                         | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                 PixelFormat.TRANSLUCENT);
         displayParams.gravity = Gravity.TOP | Gravity.START;
+        // Android 12+ allows touch-through for untrusted overlays only below 0.8 obscuring opacity.
+        displayParams.alpha = 0.78f;
         wm.addView(displayView, displayParams);
     }
 
-    /**
-     * DRAW ON uses one full-screen overlay window containing BOTH the drawing input
-     * and the toolbar. Because the toolbar is a child above the canvas, drawing can
-     * never steal toolbar touches.
-     */
-    private void showDrawingWindow() {
-        hidePalette();
-        removeToolbarStandalone();
-        removeInteractionRoot();
-
-        interactionRoot = new FrameLayout(this);
-        interactionRoot.setBackgroundColor(Color.TRANSPARENT);
-
+    private void addInputWindow() {
         inputView = new DrawingInputView(this, store, displayView);
-        applyToolSettings();
         inputView.setEraserStateListener(active -> {
             eraserActive = active;
             updateToolbarState();
         });
-        interactionRoot.addView(inputView, new FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT));
+        applyToolSettings();
 
-        detachFromParent(toolbar);
-        interactionRoot.addView(toolbar, childToolbarParams());
-        toolbar.bringToFront();
-
-        interactionParams = new WindowManager.LayoutParams(
+        inputParams = new WindowManager.LayoutParams(
                 WindowManager.LayoutParams.MATCH_PARENT,
                 WindowManager.LayoutParams.MATCH_PARENT,
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                         | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                 PixelFormat.TRANSLUCENT);
-        interactionParams.gravity = Gravity.TOP | Gravity.START;
-        wm.addView(interactionRoot, interactionParams);
-
-        drawingEnabled = true;
-        toolbarStandalone = false;
-        captureHidden = false;
-        updateToolbarState();
+        inputParams.gravity = Gravity.TOP | Gravity.START;
+        // This window draws nothing; low alpha keeps touch-through safe when PEN is OFF.
+        inputParams.alpha = 0.01f;
+        wm.addView(inputView, inputParams);
     }
 
-    /**
-     * TOUCH ON removes the full-screen touch window completely. Only the compact
-     * toolbar remains as a small overlay window, so touches outside the toolbar go
-     * directly to TradingView/PDF/Maps/etc.
-     */
-    private void showTouchWindow() {
-        hidePalette();
-        if (interactionRoot != null) {
-            try { interactionRoot.removeView(toolbar); } catch (Exception ignored) {}
-        }
-        removeInteractionRoot();
-
-        detachFromParent(toolbar);
-        toolbarWindowParams = new WindowManager.LayoutParams(
+    private void addToolbarWindow() {
+        toolbarParams = new WindowManager.LayoutParams(
                 dp(64),
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                         | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
                 PixelFormat.TRANSLUCENT);
-        toolbarWindowParams.gravity = Gravity.TOP | Gravity.START;
-        toolbarWindowParams.x = toolbarX;
-        toolbarWindowParams.y = toolbarY;
-        wm.addView(toolbar, toolbarWindowParams);
-
-        drawingEnabled = false;
-        toolbarStandalone = true;
-        inputView = null;
-        eraserActive = false;
-        captureHidden = false;
-        updateToolbarState();
+        toolbarParams.gravity = Gravity.TOP | Gravity.START;
+        toolbarParams.x = toolbarX;
+        toolbarParams.y = toolbarY;
+        wm.addView(toolbar, toolbarParams);
     }
 
     private void setDrawingEnabled(boolean enabled) {
         if (captureHidden) return;
-        if (enabled == drawingEnabled) return;
-        if (enabled) showDrawingWindow(); else showTouchWindow();
+        drawingEnabled = enabled;
+        eraserActive = false;
+        hidePalette();
+        applyDrawingMode();
+        savePreferences();
+        updateToolbarState();
+        Toast.makeText(this,
+                enabled ? "펜 입력 ON · 그리기 가능" : "펜 입력 OFF · 아래 화면 조작 가능",
+                Toast.LENGTH_SHORT).show();
     }
 
-    private void removeInteractionRoot() {
-        if (interactionRoot != null) {
-            try { wm.removeView(interactionRoot); } catch (Exception ignored) {}
-            interactionRoot = null;
+    private void applyDrawingMode() {
+        if (inputView == null || inputParams == null || wm == null) return;
+        int flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN;
+        if (!drawingEnabled || captureHidden) {
+            flags |= WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                    | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL;
         }
-        inputView = null;
-    }
-
-    private void removeToolbarStandalone() {
-        if (toolbarStandalone && toolbar != null) {
-            try { wm.removeView(toolbar); } catch (Exception ignored) {}
-            toolbarStandalone = false;
-        }
-    }
-
-    private void detachFromParent(View view) {
-        if (view == null) return;
-        if (view.getParent() instanceof ViewGroup) {
-            ((ViewGroup) view.getParent()).removeView(view);
-        }
-    }
-
-    private FrameLayout.LayoutParams childToolbarParams() {
-        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(dp(64), FrameLayout.LayoutParams.WRAP_CONTENT);
-        lp.gravity = Gravity.TOP | Gravity.START;
-        lp.leftMargin = toolbarX;
-        lp.topMargin = toolbarY;
-        return lp;
+        inputParams.flags = flags;
+        inputParams.alpha = 0.01f;
+        inputView.setEnabled(drawingEnabled && !captureHidden);
+        inputView.setVisibility(captureHidden ? View.INVISIBLE : View.VISIBLE);
+        try { wm.updateViewLayout(inputView, inputParams); } catch (Exception ignored) {}
     }
 
     private TextView b(String text) {
@@ -269,7 +265,7 @@ public class OverlayDrawingService extends Service {
         toolbar.setOrientation(LinearLayout.VERTICAL);
         toolbar.setGravity(Gravity.CENTER_HORIZONTAL);
         toolbar.setPadding(dp(6),dp(7),dp(6),dp(7));
-        toolbar.setElevation(dp(16));
+        toolbar.setElevation(dp(18));
 
         GradientDrawable bg = new GradientDrawable();
         bg.setColor(Color.argb(246,25,31,41));
@@ -281,19 +277,19 @@ public class OverlayDrawingService extends Service {
         penBtn = b("PEN");
         highBtn = b("MARK");
         eraseBtn = b("ERASE");
-        shapeBtn = b("LINE");
+        shapeBtn = b(shapeNames[shapeIndex]);
         presetBtn = b("★ PRESET");
         colorBtn = b("COLOR");
-        sizeBtn = b("5px\n100%");
+        sizeBtn = b(widthDp + "px\n" + alphaPct + "%");
         undoBtn = b("UNDO");
         redoBtn = b("REDO");
-        eyeBtn = b("SHOW");
+        eyeBtn = b("HIDE");
         clearBtn = b("CLEAR");
         pngBtn = b("SAVE\nPNG");
         pdfBtn = b("SAVE\nPDF");
         printBtn = b("PRINT");
-        toggleBtn = b("DRAW\nON");
-        exitBtn = b("EXIT");
+        toggleBtn = b("PEN\nON");
+        exitBtn = b("EXIT\nAPP");
 
         TextView[] arr = {
                 collapseBtn, penBtn, highBtn, eraseBtn, shapeBtn, presetBtn,
@@ -305,27 +301,17 @@ public class OverlayDrawingService extends Service {
         collapseBtn.setOnClickListener(v -> {
             collapsed = !collapsed;
             applyCollapsed();
+            savePreferences();
         });
-        penBtn.setOnClickListener(v -> {
-            tool = DrawingInputView.Tool.PEN;
-            applyToolSettings();
-            updateToolbarState();
-        });
-        highBtn.setOnClickListener(v -> {
-            tool = DrawingInputView.Tool.HIGHLIGHTER;
-            applyToolSettings();
-            updateToolbarState();
-        });
-        eraseBtn.setOnClickListener(v -> {
-            tool = DrawingInputView.Tool.ERASER;
-            applyToolSettings();
-            updateToolbarState();
-        });
+        penBtn.setOnClickListener(v -> selectTool(DrawingInputView.Tool.PEN));
+        highBtn.setOnClickListener(v -> selectTool(DrawingInputView.Tool.HIGHLIGHTER));
+        eraseBtn.setOnClickListener(v -> selectTool(DrawingInputView.Tool.ERASER));
         shapeBtn.setOnClickListener(v -> {
             shapeIndex = (shapeIndex + 1) % shapes.length;
             tool = shapes[shapeIndex];
             shapeBtn.setText(shapeNames[shapeIndex]);
             applyToolSettings();
+            savePreferences();
             updateToolbarState();
         });
         presetBtn.setOnClickListener(new View.OnClickListener() {
@@ -334,18 +320,16 @@ public class OverlayDrawingService extends Service {
                 p = (p + 1) % 3;
                 if (p == 0) {
                     tool = DrawingInputView.Tool.PEN;
-                    selectedColor = Color.rgb(244,67,54);
-                    widthDp = 4; alphaPct = 100;
+                    selectedColor = Color.rgb(244,67,54); widthDp = 4; alphaPct = 100;
                 } else if (p == 1) {
                     tool = DrawingInputView.Tool.HIGHLIGHTER;
-                    selectedColor = Color.rgb(255,235,59);
-                    widthDp = 18; alphaPct = 30;
+                    selectedColor = Color.rgb(255,235,59); widthDp = 18; alphaPct = 30;
                 } else {
                     tool = DrawingInputView.Tool.PEN;
-                    selectedColor = Color.rgb(33,150,243);
-                    widthDp = 7; alphaPct = 100;
+                    selectedColor = Color.rgb(33,150,243); widthDp = 7; alphaPct = 100;
                 }
                 applyToolSettings();
+                savePreferences();
                 updateToolbarState();
             }
         });
@@ -357,10 +341,8 @@ public class OverlayDrawingService extends Service {
             @Override public void onClick(View v) {
                 w = (w + 1) % ws.length;
                 if (w == 0) a = (a + 1) % as.length;
-                widthDp = ws[w];
-                alphaPct = as[a];
-                applyToolSettings();
-                updateToolbarState();
+                widthDp = ws[w]; alphaPct = as[a];
+                applyToolSettings(); savePreferences(); updateToolbarState();
             }
         });
         undoBtn.setOnClickListener(v -> { store.undo(); displayView.invalidate(); });
@@ -369,15 +351,14 @@ public class OverlayDrawingService extends Service {
             displayView.setAnnotationsVisible(!displayView.isAnnotationsVisible());
             updateToolbarState();
         });
-        clearBtn.setOnClickListener(v -> { store.clear(); displayView.invalidate(); });
+        clearBtn.setOnClickListener(v -> confirmClear());
         pngBtn.setOnClickListener(v -> requestCapture(CaptureRequestActivity.MODE_PNG));
         pdfBtn.setOnClickListener(v -> requestCapture(CaptureRequestActivity.MODE_PDF));
         printBtn.setOnClickListener(v -> requestCapture(CaptureRequestActivity.MODE_PRINT));
         toggleBtn.setOnClickListener(v -> setDrawingEnabled(!drawingEnabled));
-        exitBtn.setOnClickListener(v -> stopSelf());
+        exitBtn.setOnClickListener(v -> confirmExit());
         setBox(exitBtn, Color.rgb(176,45,45), false);
 
-        // Toolbar can be dragged using its background/padding area.
         toolbar.setOnTouchListener(new View.OnTouchListener() {
             float downX, downY;
             int startX, startY;
@@ -386,11 +367,8 @@ public class OverlayDrawingService extends Service {
             @Override public boolean onTouch(View v, MotionEvent e) {
                 switch (e.getActionMasked()) {
                     case MotionEvent.ACTION_DOWN:
-                        downX = e.getRawX();
-                        downY = e.getRawY();
-                        startX = toolbarX;
-                        startY = toolbarY;
-                        moved = false;
+                        downX = e.getRawX(); downY = e.getRawY();
+                        startX = toolbarX; startY = toolbarY; moved = false;
                         return false;
                     case MotionEvent.ACTION_MOVE:
                         float mx = e.getRawX() - downX;
@@ -406,6 +384,14 @@ public class OverlayDrawingService extends Service {
                             return true;
                         }
                         return false;
+                    case MotionEvent.ACTION_UP:
+                    case MotionEvent.ACTION_CANCEL:
+                        if (moved) {
+                            snapToolbarToEdge();
+                            savePreferences();
+                            return true;
+                        }
+                        return false;
                     default:
                         return moved;
                 }
@@ -413,20 +399,29 @@ public class OverlayDrawingService extends Service {
         });
     }
 
+    private void selectTool(DrawingInputView.Tool selected) {
+        tool = selected;
+        applyToolSettings();
+        savePreferences();
+        updateToolbarState();
+    }
+
     private void updateToolbarPosition() {
-        if (toolbarStandalone && toolbarWindowParams != null) {
-            toolbarWindowParams.x = toolbarX;
-            toolbarWindowParams.y = toolbarY;
-            try { wm.updateViewLayout(toolbar, toolbarWindowParams); } catch (Exception ignored) {}
-        } else if (toolbar != null && toolbar.getParent() == interactionRoot) {
-            FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) toolbar.getLayoutParams();
-            lp.leftMargin = toolbarX;
-            lp.topMargin = toolbarY;
-            toolbar.setLayoutParams(lp);
-        }
+        if (toolbar == null || toolbarParams == null) return;
+        toolbarParams.x = toolbarX;
+        toolbarParams.y = toolbarY;
+        try { wm.updateViewLayout(toolbar, toolbarParams); } catch (Exception ignored) {}
+    }
+
+    private void snapToolbarToEdge() {
+        int sw = getResources().getDisplayMetrics().widthPixels;
+        toolbarX = toolbarX + dp(32) < sw / 2 ? dp(8) : Math.max(dp(8), sw - dp(72));
+        updateToolbarPosition();
+        positionPalette();
     }
 
     private void applyCollapsed() {
+        if (toolbar == null) return;
         int count = toolbar.getChildCount();
         for (int i = 1; i < count; i++) {
             View child = toolbar.getChildAt(i);
@@ -461,13 +456,60 @@ public class OverlayDrawingService extends Service {
         }
 
         setBox(toggleBtn, drawingEnabled ? Color.rgb(38,124,86) : Color.rgb(133,83,39), false);
-        toggleBtn.setText(drawingEnabled ? "DRAW\nON" : "TOUCH\nON");
+        toggleBtn.setText(drawingEnabled ? "PEN\nON" : "PEN\nOFF");
         setBox(colorBtn, selectedColor, false);
         colorBtn.setText("COLOR\n●");
         colorBtn.setTextColor(contrast(selectedColor));
         sizeBtn.setText(widthDp + "px\n" + alphaPct + "%");
-        eyeBtn.setText(displayView != null && displayView.isAnnotationsVisible() ? "SHOW" : "HIDE");
+        eyeBtn.setText(displayView != null && displayView.isAnnotationsVisible() ? "HIDE" : "SHOW");
+        if (clearConfirmUntil == 0L) clearBtn.setText("CLEAR");
+        if (exitConfirmUntil == 0L) exitBtn.setText("EXIT\nAPP");
         setBox(exitBtn, Color.rgb(176,45,45), false);
+    }
+
+    private void confirmClear() {
+        long now = SystemClock.elapsedRealtime();
+        if (now <= clearConfirmUntil) {
+            clearConfirmUntil = 0L;
+            store.clear();
+            displayView.invalidate();
+            clearBtn.setText("CLEAR");
+            Toast.makeText(this, "그림을 모두 지웠습니다.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        clearConfirmUntil = now + 2500L;
+        clearBtn.setText("CLEAR?");
+        Toast.makeText(this, "전체 삭제하려면 CLEAR를 한 번 더 누르세요.", Toast.LENGTH_SHORT).show();
+        clearBtn.postDelayed(() -> {
+            if (SystemClock.elapsedRealtime() > clearConfirmUntil) {
+                clearConfirmUntil = 0L;
+                if (clearBtn != null) clearBtn.setText("CLEAR");
+            }
+        }, 2600L);
+    }
+
+    private void confirmExit() {
+        long now = SystemClock.elapsedRealtime();
+        if (now <= exitConfirmUntil) {
+            exitConfirmUntil = 0L;
+            requestFullExit();
+            return;
+        }
+        exitConfirmUntil = now + 2500L;
+        exitBtn.setText("EXIT?");
+        Toast.makeText(this, "앱을 완전히 종료하려면 EXIT를 한 번 더 누르세요.", Toast.LENGTH_SHORT).show();
+        exitBtn.postDelayed(() -> {
+            if (SystemClock.elapsedRealtime() > exitConfirmUntil) {
+                exitConfirmUntil = 0L;
+                if (exitBtn != null) exitBtn.setText("EXIT\nAPP");
+            }
+        }, 2600L);
+    }
+
+    private void requestFullExit() {
+        store.save();
+        savePreferences();
+        stopSelf();
     }
 
     private void togglePalette() {
@@ -479,8 +521,7 @@ public class OverlayDrawingService extends Service {
         paletteView = new LinearLayout(this);
         paletteView.setOrientation(LinearLayout.VERTICAL);
         paletteView.setPadding(dp(8),dp(8),dp(8),dp(8));
-        paletteView.setElevation(dp(18));
-
+        paletteView.setElevation(dp(20));
         GradientDrawable bg = new GradientDrawable();
         bg.setColor(Color.argb(248,35,38,45));
         bg.setCornerRadius(dp(16));
@@ -502,6 +543,7 @@ public class OverlayDrawingService extends Service {
                 dot.setOnClickListener(v -> {
                     selectedColor = color;
                     applyToolSettings();
+                    savePreferences();
                     hidePalette();
                     updateToolbarState();
                 });
@@ -510,71 +552,42 @@ public class OverlayDrawingService extends Service {
             paletteView.addView(row);
         }
 
+        paletteParams = new WindowManager.LayoutParams(
+                dp(138),
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                        | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                PixelFormat.TRANSLUCENT);
+        paletteParams.gravity = Gravity.TOP | Gravity.START;
         paletteVisible = true;
-        if (drawingEnabled && interactionRoot != null) {
-            paletteAsWindow = false;
-            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(dp(138), FrameLayout.LayoutParams.WRAP_CONTENT);
-            lp.gravity = Gravity.TOP | Gravity.START;
-            paletteView.setLayoutParams(lp);
-            interactionRoot.addView(paletteView);
-            positionPalette();
-            paletteView.bringToFront();
-            toolbar.bringToFront();
-        } else {
-            paletteAsWindow = true;
-            paletteWindowParams = new WindowManager.LayoutParams(
-                    dp(138),
-                    WindowManager.LayoutParams.WRAP_CONTENT,
-                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                            | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
-                    PixelFormat.TRANSLUCENT);
-            paletteWindowParams.gravity = Gravity.TOP | Gravity.START;
-            positionPaletteWindowParams();
-            wm.addView(paletteView, paletteWindowParams);
-        }
+        positionPaletteParams();
+        wm.addView(paletteView, paletteParams);
     }
 
     private void positionPalette() {
-        if (!paletteVisible || paletteView == null) return;
-        if (paletteAsWindow) {
-            positionPaletteWindowParams();
-            try { wm.updateViewLayout(paletteView, paletteWindowParams); } catch (Exception ignored) {}
-            return;
-        }
-        if (paletteView.getParent() != interactionRoot) return;
-        int sw = getResources().getDisplayMetrics().widthPixels;
-        int pw = dp(138), gap = dp(8);
-        int left = toolbarX - pw - gap;
-        int right = toolbarX + dp(64) + gap;
-        FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) paletteView.getLayoutParams();
-        lp.leftMargin = left >= 0 ? left : Math.min(sw - pw, right);
-        lp.topMargin = Math.max(dp(8), toolbarY + dp(60));
-        paletteView.setLayoutParams(lp);
+        if (!paletteVisible || paletteView == null || paletteParams == null) return;
+        positionPaletteParams();
+        try { wm.updateViewLayout(paletteView, paletteParams); } catch (Exception ignored) {}
     }
 
-    private void positionPaletteWindowParams() {
-        if (paletteWindowParams == null) return;
+    private void positionPaletteParams() {
+        if (paletteParams == null) return;
         int sw = getResources().getDisplayMetrics().widthPixels;
         int pw = dp(138), gap = dp(8);
         int left = toolbarX - pw - gap;
         int right = toolbarX + dp(64) + gap;
-        paletteWindowParams.x = left >= 0 ? left : Math.min(sw - pw, right);
-        paletteWindowParams.y = Math.max(dp(8), toolbarY + dp(60));
+        paletteParams.x = left >= 0 ? left : Math.min(sw - pw, right);
+        paletteParams.y = Math.max(dp(8), toolbarY + dp(60));
     }
 
     private void hidePalette() {
-        if (paletteView != null) {
-            if (paletteAsWindow) {
-                try { wm.removeView(paletteView); } catch (Exception ignored) {}
-            } else if (paletteView.getParent() instanceof ViewGroup) {
-                try { ((ViewGroup)paletteView.getParent()).removeView(paletteView); } catch (Exception ignored) {}
-            }
+        if (paletteView != null && wm != null) {
+            try { wm.removeView(paletteView); } catch (Exception ignored) {}
         }
         paletteView = null;
-        paletteWindowParams = null;
+        paletteParams = null;
         paletteVisible = false;
-        paletteAsWindow = false;
     }
 
     private void requestCapture(String mode) {
@@ -596,11 +609,8 @@ public class OverlayDrawingService extends Service {
     private void setCaptureHidden(boolean hidden) {
         captureHidden = hidden;
         if (displayView != null) displayView.setVisibility(hidden ? View.INVISIBLE : View.VISIBLE);
-        if (drawingEnabled) {
-            if (interactionRoot != null) interactionRoot.setVisibility(hidden ? View.INVISIBLE : View.VISIBLE);
-        } else {
-            if (toolbar != null && toolbarStandalone) toolbar.setVisibility(hidden ? View.INVISIBLE : View.VISIBLE);
-        }
+        if (toolbar != null) toolbar.setVisibility(hidden ? View.INVISIBLE : View.VISIBLE);
+        applyDrawingMode();
         if (!hidden && displayView != null) displayView.invalidate();
     }
 
@@ -614,22 +624,22 @@ public class OverlayDrawingService extends Service {
         PendingIntent op = PendingIntent.getActivity(this, 1, open,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
 
-        Intent cl = new Intent(this, OverlayDrawingService.class).setAction(ACTION_CLEAR);
-        PendingIntent cp = PendingIntent.getService(this, 2, cl,
+        Intent toggle = new Intent(this, OverlayDrawingService.class).setAction(ACTION_TOGGLE);
+        PendingIntent tp = PendingIntent.getService(this, 2, toggle,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
 
-        Intent st = new Intent(this, OverlayDrawingService.class).setAction(ACTION_STOP);
-        PendingIntent sp = PendingIntent.getService(this, 3, st,
+        Intent stop = new Intent(this, OverlayDrawingService.class).setAction(ACTION_STOP);
+        PendingIntent sp = PendingIntent.getService(this, 3, stop,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
 
         return new Notification.Builder(this, "screen_sketch")
-                .setContentTitle("Screen Sketch S Pen v1.3")
-                .setContentText("PNG/PDF/PRINT · 빨간 EXIT 또는 알림에서 언제든 종료")
+                .setContentTitle("Screen Sketch S Pen v1.4")
+                .setContentText("툴바 상시 유지 · 그림 자동복구 · PNG/PDF/PRINT")
                 .setSmallIcon(R.drawable.ic_pen)
                 .setContentIntent(op)
                 .setOngoing(true)
-                .addAction(R.drawable.ic_pen, "전체 삭제", cp)
-                .addAction(R.drawable.ic_pen, "종료", sp)
+                .addAction(R.drawable.ic_pen, "펜 ON/OFF", tp)
+                .addAction(R.drawable.ic_pen, "앱 완전 종료", sp)
                 .build();
     }
 
@@ -643,17 +653,13 @@ public class OverlayDrawingService extends Service {
     }
 
     @Override public void onDestroy() {
+        store.save();
+        savePreferences();
         hidePalette();
         if (wm != null) {
-            if (toolbarStandalone && toolbar != null) {
-                try { wm.removeView(toolbar); } catch (Exception ignored) {}
-            }
-            if (interactionRoot != null) {
-                try { wm.removeView(interactionRoot); } catch (Exception ignored) {}
-            }
-            if (displayView != null) {
-                try { wm.removeView(displayView); } catch (Exception ignored) {}
-            }
+            if (toolbar != null) try { wm.removeView(toolbar); } catch (Exception ignored) {}
+            if (inputView != null) try { wm.removeView(inputView); } catch (Exception ignored) {}
+            if (displayView != null) try { wm.removeView(displayView); } catch (Exception ignored) {}
         }
         super.onDestroy();
     }

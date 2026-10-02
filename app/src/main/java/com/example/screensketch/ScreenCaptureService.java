@@ -43,6 +43,7 @@ public class ScreenCaptureService extends Service {
 
     @Override public void onCreate() {
         super.onCreate();
+        StrokeStore.get().init(getApplicationContext());
         createChannel();
     }
 
