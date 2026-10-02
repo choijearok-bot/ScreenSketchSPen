@@ -26,6 +26,8 @@ public class OverlayDrawingService extends Service {
     public static final String ACTION_CAPTURE_RESTORE = "com.example.screensketch.CAPTURE_RESTORE";
 
     private static final String PREFS = "screen_sketch_state_v14";
+    private static final int TOOLBAR_EXPANDED_WIDTH_DP = 116;
+    private static final int TOOLBAR_COLLAPSED_WIDTH_DP = 54;
 
     private WindowManager wm;
     private DrawingDisplayView displayView;
@@ -252,7 +254,7 @@ public class OverlayDrawingService extends Service {
 
     private void addToolbarWindow() {
         toolbarParams = new WindowManager.LayoutParams(
-                dp(64),
+                dp(TOOLBAR_EXPANDED_WIDTH_DP),
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
@@ -262,6 +264,7 @@ public class OverlayDrawingService extends Service {
         toolbarParams.x = toolbarX;
         toolbarParams.y = toolbarY;
         wm.addView(toolbar, toolbarParams);
+        toolbar.post(this::clampToolbarToScreen);
     }
 
     private void setDrawingEnabled(boolean enabled) {
@@ -301,7 +304,7 @@ public class OverlayDrawingService extends Service {
         v.setGravity(Gravity.CENTER);
         v.setPadding(dp(2),dp(2),dp(2),dp(2));
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(48), dp(42));
-        lp.setMargins(0,dp(2),0,dp(2));
+        lp.setMargins(dp(2),dp(2),dp(2),dp(2));
         v.setLayoutParams(lp);
         setBox(v, Color.rgb(58,68,82), false);
         return v;
@@ -350,12 +353,23 @@ public class OverlayDrawingService extends Service {
         toggleBtn = b("PEN\nON");
         exitBtn = b("EXIT\nAPP");
 
-        TextView[] arr = {
-                collapseBtn, penBtn, highBtn, eraseBtn, shapeBtn, lassoBtn, presetBtn,
-                colorBtn, sizeBtn, lockBtn, undoBtn, redoBtn, recoverBtn, workBtn, eyeBtn, clearBtn,
-                pngBtn, pdfBtn, printBtn, toggleBtn, exitBtn
-        };
-        for (TextView v : arr) toolbar.addView(v);
+        // Keep the toolbar compact enough for Galaxy Tab landscape mode.
+        // The collapse button stays on top; all other tools are arranged in two columns.
+        LinearLayout.LayoutParams collapseLp = new LinearLayout.LayoutParams(dp(104), dp(38));
+        collapseLp.setMargins(dp(2),dp(2),dp(2),dp(3));
+        collapseBtn.setLayoutParams(collapseLp);
+        toolbar.addView(collapseBtn);
+
+        addToolbarPair(toggleBtn, exitBtn);
+        addToolbarPair(penBtn, highBtn);
+        addToolbarPair(eraseBtn, shapeBtn);
+        addToolbarPair(lassoBtn, presetBtn);
+        addToolbarPair(colorBtn, sizeBtn);
+        addToolbarPair(lockBtn, eyeBtn);
+        addToolbarPair(undoBtn, redoBtn);
+        addToolbarPair(recoverBtn, workBtn);
+        addToolbarPair(clearBtn, pngBtn);
+        addToolbarPair(pdfBtn, printBtn);
 
         collapseBtn.setOnClickListener(v -> {
             collapsed = !collapsed;
@@ -443,8 +457,10 @@ public class OverlayDrawingService extends Service {
                             moved = true;
                             int sw = getResources().getDisplayMetrics().widthPixels;
                             int sh = getResources().getDisplayMetrics().heightPixels;
-                            toolbarX = Math.max(0, Math.min(sw - dp(64), startX + (int)mx));
-                            toolbarY = Math.max(0, Math.min(sh - dp(80), startY + (int)my));
+                            int tw = currentToolbarWidthPx();
+                            int th = currentToolbarHeightPx();
+                            toolbarX = Math.max(0, Math.min(Math.max(0, sw - tw), startX + (int)mx));
+                            toolbarY = Math.max(0, Math.min(Math.max(0, sh - th), startY + (int)my));
                             updateToolbarPosition();
                             positionPalette();
                             positionPresetPanel();
@@ -466,6 +482,38 @@ public class OverlayDrawingService extends Service {
         });
     }
 
+    private void addToolbarPair(View left, View right) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER);
+        row.addView(left);
+        row.addView(right);
+        toolbar.addView(row, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+    }
+
+    private int currentToolbarWidthPx() {
+        return dp(collapsed ? TOOLBAR_COLLAPSED_WIDTH_DP : TOOLBAR_EXPANDED_WIDTH_DP);
+    }
+
+    private int currentToolbarHeightPx() {
+        if (toolbar != null && toolbar.getMeasuredHeight() > 0) return toolbar.getMeasuredHeight();
+        return dp(collapsed ? 54 : 520);
+    }
+
+    private void clampToolbarToScreen() {
+        if (toolbarParams == null) return;
+        int sw = getResources().getDisplayMetrics().widthPixels;
+        int sh = getResources().getDisplayMetrics().heightPixels;
+        int tw = currentToolbarWidthPx();
+        int th = currentToolbarHeightPx();
+        toolbarX = Math.max(0, Math.min(Math.max(0, sw - tw), toolbarX));
+        toolbarY = Math.max(0, Math.min(Math.max(0, sh - th), toolbarY));
+        toolbarParams.x = toolbarX;
+        toolbarParams.y = toolbarY;
+        try { wm.updateViewLayout(toolbar, toolbarParams); } catch (Exception ignored) {}
+    }
+
     private void selectTool(DrawingInputView.Tool selected) {
         tool = selected;
         applyToolSettings();
@@ -482,7 +530,9 @@ public class OverlayDrawingService extends Service {
 
     private void snapToolbarToEdge() {
         int sw = getResources().getDisplayMetrics().widthPixels;
-        toolbarX = toolbarX + dp(32) < sw / 2 ? dp(8) : Math.max(dp(8), sw - dp(72));
+        int tw = currentToolbarWidthPx();
+        toolbarX = toolbarX + tw / 2 < sw / 2 ? dp(8) : Math.max(dp(8), sw - tw - dp(8));
+        clampToolbarToScreen();
         updateToolbarPosition();
         positionPalette();
         positionPresetPanel();
@@ -510,14 +560,15 @@ public class OverlayDrawingService extends Service {
             bg.setCornerRadius(dp(18));
             toolbar.setPadding(dp(6),dp(7),dp(6),dp(7));
             LinearLayout.LayoutParams lp = (LinearLayout.LayoutParams) collapseBtn.getLayoutParams();
-            lp.width = dp(48); lp.height = dp(42); lp.setMargins(0,dp(2),0,dp(2)); collapseBtn.setLayoutParams(lp);
+            lp.width = dp(104); lp.height = dp(38); lp.setMargins(dp(2),dp(2),dp(2),dp(3)); collapseBtn.setLayoutParams(lp);
             setBox(collapseBtn, Color.rgb(58,68,82), false);
         }
         toolbar.setBackground(bg);
         if (toolbarParams != null) {
-            toolbarParams.width = dp(collapsed ? 54 : 64);
+            toolbarParams.width = dp(collapsed ? TOOLBAR_COLLAPSED_WIDTH_DP : TOOLBAR_EXPANDED_WIDTH_DP);
             toolbarParams.height = WindowManager.LayoutParams.WRAP_CONTENT;
             try { wm.updateViewLayout(toolbar, toolbarParams); } catch (Exception ignored) {}
+            toolbar.post(this::clampToolbarToScreen);
         }
     }
 
@@ -682,7 +733,7 @@ public class OverlayDrawingService extends Service {
         int sw = getResources().getDisplayMetrics().widthPixels;
         int pw = dp(138), gap = dp(8);
         int left = toolbarX - pw - gap;
-        int right = toolbarX + dp(64) + gap;
+        int right = toolbarX + currentToolbarWidthPx() + gap;
         paletteParams.x = left >= 0 ? left : Math.min(sw - pw, right);
         paletteParams.y = Math.max(dp(8), toolbarY + dp(60));
     }
@@ -734,7 +785,7 @@ public class OverlayDrawingService extends Service {
     private void positionPresetParams() {
         if (presetParams==null) return;
         int sw=getResources().getDisplayMetrics().widthPixels, pw=dp(142), gap=dp(8);
-        int left=toolbarX-pw-gap, right=toolbarX+dp(64)+gap;
+        int left=toolbarX-pw-gap, right=toolbarX+currentToolbarWidthPx()+gap;
         presetParams.x=left>=0?left:Math.min(sw-pw,right); presetParams.y=Math.max(dp(8),toolbarY+dp(60));
     }
 
@@ -782,9 +833,9 @@ public class OverlayDrawingService extends Service {
         int sw = getResources().getDisplayMetrics().widthPixels;
         int sh = getResources().getDisplayMetrics().heightPixels;
         store.setCanvasSize(sw, sh);
-        toolbarX = Math.max(0, Math.min(sw - dp(collapsed ? 54 : 64), toolbarX));
-        toolbarY = Math.max(0, Math.min(sh - dp(70), toolbarY));
+        clampToolbarToScreen();
         snapToolbarToEdge();
+        toolbar.post(this::clampToolbarToScreen);
         if (displayView != null) displayView.invalidate();
         savePreferences();
     }
@@ -803,7 +854,7 @@ public class OverlayDrawingService extends Service {
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
 
         return new Notification.Builder(this, "screen_sketch")
-                .setContentTitle("Screen Sketch S Pen v1.5")
+                .setContentTitle("Screen Sketch S Pen v1.5.1")
                 .setContentText((drawingEnabled ? "PEN ON" : "PEN OFF") + " · 자동저장/복구 · WORK · LASSO")
                 .setSmallIcon(R.drawable.ic_pen)
                 .setContentIntent(op)

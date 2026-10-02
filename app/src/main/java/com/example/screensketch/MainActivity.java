@@ -30,7 +30,7 @@ public class MainActivity extends Activity {
         root.setBackgroundColor(Color.rgb(248,249,252));
 
         TextView title = new TextView(this);
-        title.setText("Screen Sketch S Pen v1.5");
+        title.setText("Screen Sketch S Pen v1.5.1");
         title.setTextSize(26);
         title.setTextColor(Color.rgb(25,28,35));
         title.setGravity(Gravity.CENTER);
