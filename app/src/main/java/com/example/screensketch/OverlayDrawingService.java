@@ -4,6 +4,7 @@ import android.app.*;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.ServiceInfo;
+import android.content.res.Configuration;
 import android.graphics.Color;
 import android.graphics.PixelFormat;
 import android.graphics.drawable.GradientDrawable;
@@ -31,11 +32,13 @@ public class OverlayDrawingService extends Service {
     private DrawingInputView inputView;
     private LinearLayout toolbar;
     private LinearLayout paletteView;
+    private LinearLayout presetView;
 
     private WindowManager.LayoutParams displayParams;
     private WindowManager.LayoutParams inputParams;
     private WindowManager.LayoutParams toolbarParams;
     private WindowManager.LayoutParams paletteParams;
+    private WindowManager.LayoutParams presetParams;
 
     private final StrokeStore store = StrokeStore.get();
     private SharedPreferences prefs;
@@ -45,6 +48,8 @@ public class OverlayDrawingService extends Service {
     private boolean paletteVisible = false;
     private boolean eraserActive = false;
     private boolean captureHidden = false;
+    private boolean toolbarLocked = false;
+    private boolean presetVisible = false;
 
     private int selectedColor = Color.rgb(244,67,54);
     private int widthDp = 5;
@@ -54,6 +59,7 @@ public class OverlayDrawingService extends Service {
 
     private TextView collapseBtn, penBtn, highBtn, eraseBtn, shapeBtn, presetBtn,
             colorBtn, sizeBtn, undoBtn, redoBtn, eyeBtn, clearBtn,
+            lassoBtn, lockBtn, workBtn, recoverBtn,
             pngBtn, pdfBtn, printBtn, toggleBtn, exitBtn;
 
     private int toolbarX, toolbarY;
@@ -92,7 +98,9 @@ public class OverlayDrawingService extends Service {
 
         store.init(getApplicationContext());
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+        initializePresetDefaults();
         restorePreferences();
+        store.setCanvasSize(getResources().getDisplayMetrics().widthPixels, getResources().getDisplayMetrics().heightPixels);
 
         wm = (WindowManager) getSystemService(WINDOW_SERVICE);
         addDisplayWindow();
@@ -121,6 +129,50 @@ public class OverlayDrawingService extends Service {
         return START_STICKY;
     }
 
+    private void initializePresetDefaults() {
+        if (prefs == null || prefs.getBoolean("presetInit", false)) return;
+        int[] pc = {Color.rgb(244,67,54), Color.rgb(255,235,59), Color.rgb(33,150,243), Color.BLACK, Color.rgb(76,175,80)};
+        int[] pw = {4,18,7,5,5};
+        int[] pa = {100,30,100,100,100};
+        DrawingInputView.Tool[] pt = {DrawingInputView.Tool.PEN, DrawingInputView.Tool.HIGHLIGHTER, DrawingInputView.Tool.PEN, DrawingInputView.Tool.PEN, DrawingInputView.Tool.PEN};
+        SharedPreferences.Editor e = prefs.edit().putBoolean("presetInit", true);
+        for (int i=0;i<5;i++) {
+            e.putInt("p"+i+"_color",pc[i]).putInt("p"+i+"_width",pw[i]).putInt("p"+i+"_alpha",pa[i]).putInt("p"+i+"_tool",pt[i].ordinal());
+        }
+        e.apply();
+    }
+
+    private void applyPreset(int index) {
+        selectedColor = prefs.getInt("p"+index+"_color", selectedColor);
+        widthDp = prefs.getInt("p"+index+"_width", widthDp);
+        alphaPct = prefs.getInt("p"+index+"_alpha", alphaPct);
+        int ordinal = prefs.getInt("p"+index+"_tool", DrawingInputView.Tool.PEN.ordinal());
+        DrawingInputView.Tool[] values = DrawingInputView.Tool.values();
+        tool = ordinal >= 0 && ordinal < values.length ? values[ordinal] : DrawingInputView.Tool.PEN;
+        if (tool == DrawingInputView.Tool.LASSO || tool == DrawingInputView.Tool.ERASER) tool = DrawingInputView.Tool.PEN;
+        rememberRecentColor(selectedColor);
+        applyToolSettings(); savePreferences(); updateToolbarState(); hidePresetPanel();
+        Toast.makeText(this, "P"+(index+1)+" 펜 적용", Toast.LENGTH_SHORT).show();
+    }
+
+    private void savePreset(int index) {
+        DrawingInputView.Tool saveTool = tool == DrawingInputView.Tool.HIGHLIGHTER ? DrawingInputView.Tool.HIGHLIGHTER : DrawingInputView.Tool.PEN;
+        prefs.edit().putInt("p"+index+"_color",selectedColor).putInt("p"+index+"_width",widthDp)
+                .putInt("p"+index+"_alpha",alphaPct).putInt("p"+index+"_tool",saveTool.ordinal()).apply();
+        Toast.makeText(this, "현재 펜을 P"+(index+1)+"에 저장", Toast.LENGTH_SHORT).show();
+    }
+
+    private void rememberRecentColor(int color) {
+        if (prefs == null) return;
+        int[] recent = new int[4];
+        for (int i=0;i<4;i++) recent[i]=prefs.getInt("recentColor"+i, i==0?selectedColor:Color.TRANSPARENT);
+        SharedPreferences.Editor e=prefs.edit(); e.putInt("recentColor0",color);
+        int out=1;
+        for (int c:recent) { if (c==Color.TRANSPARENT || c==color || out>=4) continue; e.putInt("recentColor"+out,c); out++; }
+        while(out<4){e.putInt("recentColor"+out,Color.TRANSPARENT);out++;}
+        e.apply();
+    }
+
     private void restorePreferences() {
         int sw = getResources().getDisplayMetrics().widthPixels;
         int sh = getResources().getDisplayMetrics().heightPixels;
@@ -135,6 +187,7 @@ public class OverlayDrawingService extends Service {
         smoothingPct = prefs.getInt("smoothingPct", 45);
         toolbarX = prefs.getInt("toolbarX", defaultX);
         toolbarY = prefs.getInt("toolbarY", defaultY);
+        toolbarLocked = prefs.getBoolean("toolbarLocked", false);
 
         int toolOrdinal = prefs.getInt("tool", DrawingInputView.Tool.PEN.ordinal());
         DrawingInputView.Tool[] values = DrawingInputView.Tool.values();
@@ -155,6 +208,7 @@ public class OverlayDrawingService extends Service {
                 .putInt("smoothingPct", smoothingPct)
                 .putInt("toolbarX", toolbarX)
                 .putInt("toolbarY", toolbarY)
+                .putBoolean("toolbarLocked", toolbarLocked)
                 .putInt("tool", tool.ordinal())
                 .apply();
     }
@@ -215,6 +269,7 @@ public class OverlayDrawingService extends Service {
         drawingEnabled = enabled;
         eraserActive = false;
         hidePalette();
+        hidePresetPanel();
         applyDrawingMode();
         savePreferences();
         updateToolbarState();
@@ -278,11 +333,15 @@ public class OverlayDrawingService extends Service {
         highBtn = b("MARK");
         eraseBtn = b("ERASE");
         shapeBtn = b(shapeNames[shapeIndex]);
-        presetBtn = b("★ PRESET");
+        lassoBtn = b("LASSO");
+        presetBtn = b("★ PENS");
         colorBtn = b("COLOR");
         sizeBtn = b(widthDp + "px\n" + alphaPct + "%");
+        lockBtn = b("LOCK");
         undoBtn = b("UNDO");
         redoBtn = b("REDO");
+        recoverBtn = b("RECOVER");
+        workBtn = b("WORK");
         eyeBtn = b("HIDE");
         clearBtn = b("CLEAR");
         pngBtn = b("SAVE\nPNG");
@@ -292,8 +351,8 @@ public class OverlayDrawingService extends Service {
         exitBtn = b("EXIT\nAPP");
 
         TextView[] arr = {
-                collapseBtn, penBtn, highBtn, eraseBtn, shapeBtn, presetBtn,
-                colorBtn, sizeBtn, undoBtn, redoBtn, eyeBtn, clearBtn,
+                collapseBtn, penBtn, highBtn, eraseBtn, shapeBtn, lassoBtn, presetBtn,
+                colorBtn, sizeBtn, lockBtn, undoBtn, redoBtn, recoverBtn, workBtn, eyeBtn, clearBtn,
                 pngBtn, pdfBtn, printBtn, toggleBtn, exitBtn
         };
         for (TextView v : arr) toolbar.addView(v);
@@ -306,6 +365,7 @@ public class OverlayDrawingService extends Service {
         penBtn.setOnClickListener(v -> selectTool(DrawingInputView.Tool.PEN));
         highBtn.setOnClickListener(v -> selectTool(DrawingInputView.Tool.HIGHLIGHTER));
         eraseBtn.setOnClickListener(v -> selectTool(DrawingInputView.Tool.ERASER));
+        lassoBtn.setOnClickListener(v -> selectTool(DrawingInputView.Tool.LASSO));
         shapeBtn.setOnClickListener(v -> {
             shapeIndex = (shapeIndex + 1) % shapes.length;
             tool = shapes[shapeIndex];
@@ -314,25 +374,7 @@ public class OverlayDrawingService extends Service {
             savePreferences();
             updateToolbarState();
         });
-        presetBtn.setOnClickListener(new View.OnClickListener() {
-            int p = -1;
-            @Override public void onClick(View v) {
-                p = (p + 1) % 3;
-                if (p == 0) {
-                    tool = DrawingInputView.Tool.PEN;
-                    selectedColor = Color.rgb(244,67,54); widthDp = 4; alphaPct = 100;
-                } else if (p == 1) {
-                    tool = DrawingInputView.Tool.HIGHLIGHTER;
-                    selectedColor = Color.rgb(255,235,59); widthDp = 18; alphaPct = 30;
-                } else {
-                    tool = DrawingInputView.Tool.PEN;
-                    selectedColor = Color.rgb(33,150,243); widthDp = 7; alphaPct = 100;
-                }
-                applyToolSettings();
-                savePreferences();
-                updateToolbarState();
-            }
-        });
+        presetBtn.setOnClickListener(v -> togglePresetPanel());
         colorBtn.setOnClickListener(v -> togglePalette());
         sizeBtn.setOnClickListener(new View.OnClickListener() {
             int w = 0, a = 0;
@@ -344,6 +386,28 @@ public class OverlayDrawingService extends Service {
                 widthDp = ws[w]; alphaPct = as[a];
                 applyToolSettings(); savePreferences(); updateToolbarState();
             }
+        });
+        lockBtn.setOnClickListener(v -> {
+            toolbarLocked = !toolbarLocked;
+            savePreferences();
+            updateToolbarState();
+            Toast.makeText(this, toolbarLocked ? "툴바 위치 잠금" : "툴바 위치 잠금 해제", Toast.LENGTH_SHORT).show();
+        });
+        workBtn.setOnClickListener(v -> {
+            String name = store.exportWork(getApplicationContext());
+            Toast.makeText(this, name == null ? "작업파일 저장 실패" : "작업파일 저장: " + name, Toast.LENGTH_LONG).show();
+        });
+        workBtn.setOnLongClickListener(v -> {
+            String name = store.importLatestWork(getApplicationContext());
+            if (name == null) Toast.makeText(this, "불러올 작업파일이 없습니다.", Toast.LENGTH_LONG).show();
+            else { displayView.invalidate(); Toast.makeText(this, "최근 작업 불러오기: " + name, Toast.LENGTH_LONG).show(); }
+            return true;
+        });
+        recoverBtn.setOnClickListener(v -> {
+            if (store.restorePreviousHistory()) {
+                displayView.invalidate();
+                Toast.makeText(this, "이전 자동저장 상태를 복구했습니다.", Toast.LENGTH_SHORT).show();
+            } else Toast.makeText(this, "복구할 이전 상태가 없습니다.", Toast.LENGTH_SHORT).show();
         });
         undoBtn.setOnClickListener(v -> { store.undo(); displayView.invalidate(); });
         redoBtn.setOnClickListener(v -> { store.redo(); displayView.invalidate(); });
@@ -367,10 +431,12 @@ public class OverlayDrawingService extends Service {
             @Override public boolean onTouch(View v, MotionEvent e) {
                 switch (e.getActionMasked()) {
                     case MotionEvent.ACTION_DOWN:
+                        if (toolbarLocked) return false;
                         downX = e.getRawX(); downY = e.getRawY();
                         startX = toolbarX; startY = toolbarY; moved = false;
                         return false;
                     case MotionEvent.ACTION_MOVE:
+                        if (toolbarLocked) return false;
                         float mx = e.getRawX() - downX;
                         float my = e.getRawY() - downY;
                         if (Math.hypot(mx, my) > dp(10)) {
@@ -381,6 +447,7 @@ public class OverlayDrawingService extends Service {
                             toolbarY = Math.max(0, Math.min(sh - dp(80), startY + (int)my));
                             updateToolbarPosition();
                             positionPalette();
+                            positionPresetPanel();
                             return true;
                         }
                         return false;
@@ -418,19 +485,40 @@ public class OverlayDrawingService extends Service {
         toolbarX = toolbarX + dp(32) < sw / 2 ? dp(8) : Math.max(dp(8), sw - dp(72));
         updateToolbarPosition();
         positionPalette();
+        positionPresetPanel();
     }
 
     private void applyCollapsed() {
         if (toolbar == null) return;
         int count = toolbar.getChildCount();
-        for (int i = 1; i < count; i++) {
-            View child = toolbar.getChildAt(i);
-            boolean safety = child == toggleBtn || child == exitBtn;
-            child.setVisibility(collapsed && !safety ? View.GONE : View.VISIBLE);
-        }
+        for (int i = 1; i < count; i++) toolbar.getChildAt(i).setVisibility(collapsed ? View.GONE : View.VISIBLE);
         collapseBtn.setVisibility(View.VISIBLE);
-        collapseBtn.setText(collapsed ? "▶\nTOOLS" : "◀\nHIDE");
+        collapseBtn.setText(collapsed ? "✎" : "◀\nHIDE");
         hidePalette();
+        hidePresetPanel();
+
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(Color.argb(246,25,31,41));
+        bg.setStroke(dp(1),Color.argb(80,255,255,255));
+        if (collapsed) {
+            bg.setShape(GradientDrawable.OVAL);
+            toolbar.setPadding(dp(4),dp(4),dp(4),dp(4));
+            LinearLayout.LayoutParams lp = (LinearLayout.LayoutParams) collapseBtn.getLayoutParams();
+            lp.width = dp(46); lp.height = dp(46); lp.setMargins(0,0,0,0); collapseBtn.setLayoutParams(lp);
+            GradientDrawable cg = new GradientDrawable(); cg.setShape(GradientDrawable.OVAL); cg.setColor(Color.rgb(58,68,82)); cg.setStroke(dp(1),Color.WHITE); collapseBtn.setBackground(cg);
+        } else {
+            bg.setCornerRadius(dp(18));
+            toolbar.setPadding(dp(6),dp(7),dp(6),dp(7));
+            LinearLayout.LayoutParams lp = (LinearLayout.LayoutParams) collapseBtn.getLayoutParams();
+            lp.width = dp(48); lp.height = dp(42); lp.setMargins(0,dp(2),0,dp(2)); collapseBtn.setLayoutParams(lp);
+            setBox(collapseBtn, Color.rgb(58,68,82), false);
+        }
+        toolbar.setBackground(bg);
+        if (toolbarParams != null) {
+            toolbarParams.width = dp(collapsed ? 54 : 64);
+            toolbarParams.height = WindowManager.LayoutParams.WRAP_CONTENT;
+            try { wm.updateViewLayout(toolbar, toolbarParams); } catch (Exception ignored) {}
+        }
     }
 
     private void applyToolSettings() {
@@ -444,7 +532,7 @@ public class OverlayDrawingService extends Service {
 
     private void updateToolbarState() {
         if (toolbar == null) return;
-        TextView[] tools = {penBtn,highBtn,eraseBtn,shapeBtn};
+        TextView[] tools = {penBtn,highBtn,eraseBtn,shapeBtn,lassoBtn};
         for (TextView v : tools) if (v != null) setBox(v, Color.rgb(58,68,82), false);
 
         if (tool == DrawingInputView.Tool.PEN) setBox(penBtn, Color.rgb(90,104,122), true);
@@ -453,6 +541,8 @@ public class OverlayDrawingService extends Service {
         else if (tool == DrawingInputView.Tool.LINE || tool == DrawingInputView.Tool.ARROW
                 || tool == DrawingInputView.Tool.RECT || tool == DrawingInputView.Tool.ELLIPSE) {
             setBox(shapeBtn, Color.rgb(90,104,122), true);
+        } else if (tool == DrawingInputView.Tool.LASSO) {
+            setBox(lassoBtn, Color.rgb(90,104,122), true);
         }
 
         setBox(toggleBtn, drawingEnabled ? Color.rgb(38,124,86) : Color.rgb(133,83,39), false);
@@ -461,6 +551,8 @@ public class OverlayDrawingService extends Service {
         colorBtn.setText("COLOR\n●");
         colorBtn.setTextColor(contrast(selectedColor));
         sizeBtn.setText(widthDp + "px\n" + alphaPct + "%");
+        lockBtn.setText(toolbarLocked ? "UNLOCK" : "LOCK");
+        setBox(lockBtn, toolbarLocked ? Color.rgb(95,72,150) : Color.rgb(58,68,82), toolbarLocked);
         eyeBtn.setText(displayView != null && displayView.isAnnotationsVisible() ? "HIDE" : "SHOW");
         if (clearConfirmUntil == 0L) clearBtn.setText("CLEAR");
         if (exitConfirmUntil == 0L) exitBtn.setText("EXIT\nAPP");
@@ -513,10 +605,12 @@ public class OverlayDrawingService extends Service {
     }
 
     private void togglePalette() {
+        hidePresetPanel();
         if (paletteVisible) hidePalette(); else showPalette();
     }
 
     private void showPalette() {
+        hidePresetPanel();
         hidePalette();
         paletteView = new LinearLayout(this);
         paletteView.setOrientation(LinearLayout.VERTICAL);
@@ -526,6 +620,17 @@ public class OverlayDrawingService extends Service {
         bg.setColor(Color.argb(248,35,38,45));
         bg.setCornerRadius(dp(16));
         paletteView.setBackground(bg);
+
+        LinearLayout recentRow = new LinearLayout(this);
+        for (int i=0;i<4;i++) {
+            final int rc=prefs.getInt("recentColor"+i, i==0?selectedColor:Color.TRANSPARENT);
+            if (rc==Color.TRANSPARENT) continue;
+            TextView dot=new TextView(this); LinearLayout.LayoutParams rlp=new LinearLayout.LayoutParams(dp(28),dp(28)); rlp.setMargins(dp(3),dp(3),dp(3),dp(6)); dot.setLayoutParams(rlp);
+            GradientDrawable rg=new GradientDrawable(); rg.setShape(GradientDrawable.OVAL); rg.setColor(rc); rg.setStroke(dp(2),Color.WHITE); dot.setBackground(rg);
+            dot.setOnClickListener(v->{selectedColor=rc;rememberRecentColor(rc);applyToolSettings();savePreferences();hidePalette();updateToolbarState();});
+            recentRow.addView(dot);
+        }
+        if (recentRow.getChildCount()>0) paletteView.addView(recentRow);
 
         for (int r = 0; r < 4; r++) {
             LinearLayout row = new LinearLayout(this);
@@ -542,6 +647,7 @@ public class OverlayDrawingService extends Service {
                 dot.setBackground(g);
                 dot.setOnClickListener(v -> {
                     selectedColor = color;
+                    rememberRecentColor(color);
                     applyToolSettings();
                     savePreferences();
                     hidePalette();
@@ -590,9 +696,57 @@ public class OverlayDrawingService extends Service {
         paletteVisible = false;
     }
 
+    private void togglePresetPanel() {
+        hidePalette();
+        if (presetVisible) hidePresetPanel(); else showPresetPanel();
+    }
+
+    private void showPresetPanel() {
+        hidePresetPanel();
+        presetView = new LinearLayout(this);
+        presetView.setOrientation(LinearLayout.VERTICAL);
+        presetView.setPadding(dp(8),dp(8),dp(8),dp(8));
+        presetView.setElevation(dp(20));
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(Color.argb(248,35,38,45)); bg.setCornerRadius(dp(16));
+        presetView.setBackground(bg);
+        TextView help = new TextView(this);
+        help.setText("탭=적용\n길게=현재펜 저장"); help.setTextColor(Color.LTGRAY); help.setTextSize(9); help.setGravity(Gravity.CENTER);
+        presetView.addView(help, new LinearLayout.LayoutParams(dp(126),dp(38)));
+        for (int i=0;i<5;i++) {
+            final int idx=i; TextView item=b("P"+(i+1));
+            LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(dp(126),dp(38)); lp.setMargins(0,dp(2),0,dp(2)); item.setLayoutParams(lp);
+            int c=prefs.getInt("p"+i+"_color",Color.WHITE); setBox(item,c,false); item.setTextColor(contrast(c));
+            item.setOnClickListener(v -> applyPreset(idx));
+            item.setOnLongClickListener(v -> { savePreset(idx); hidePresetPanel(); return true; });
+            presetView.addView(item);
+        }
+        presetParams = new WindowManager.LayoutParams(dp(142),WindowManager.LayoutParams.WRAP_CONTENT,WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE|WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,PixelFormat.TRANSLUCENT);
+        presetParams.gravity=Gravity.TOP|Gravity.START; presetVisible=true; positionPresetParams(); wm.addView(presetView,presetParams);
+    }
+
+    private void positionPresetPanel() {
+        if (!presetVisible || presetView==null || presetParams==null) return;
+        positionPresetParams(); try { wm.updateViewLayout(presetView,presetParams); } catch(Exception ignored) {}
+    }
+
+    private void positionPresetParams() {
+        if (presetParams==null) return;
+        int sw=getResources().getDisplayMetrics().widthPixels, pw=dp(142), gap=dp(8);
+        int left=toolbarX-pw-gap, right=toolbarX+dp(64)+gap;
+        presetParams.x=left>=0?left:Math.min(sw-pw,right); presetParams.y=Math.max(dp(8),toolbarY+dp(60));
+    }
+
+    private void hidePresetPanel() {
+        if (presetView!=null && wm!=null) try { wm.removeView(presetView); } catch(Exception ignored) {}
+        presetView=null; presetParams=null; presetVisible=false;
+    }
+
     private void requestCapture(String mode) {
         if (captureHidden) return;
         hidePalette();
+        hidePresetPanel();
         Toast.makeText(this, "화면 캡처 허용 창에서 '전체 화면'을 선택하세요.", Toast.LENGTH_LONG).show();
         setCaptureHidden(true);
         try {
@@ -619,6 +773,22 @@ public class OverlayDrawingService extends Service {
         return .299 * r + .587 * g + .114 * b > 170 ? Color.BLACK : Color.WHITE;
     }
 
+    private void refreshNotification() {
+        try { ((NotificationManager)getSystemService(NOTIFICATION_SERVICE)).notify(1001, buildNotification()); } catch (Exception ignored) {}
+    }
+
+    @Override public void onConfigurationChanged(Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        int sw = getResources().getDisplayMetrics().widthPixels;
+        int sh = getResources().getDisplayMetrics().heightPixels;
+        store.setCanvasSize(sw, sh);
+        toolbarX = Math.max(0, Math.min(sw - dp(collapsed ? 54 : 64), toolbarX));
+        toolbarY = Math.max(0, Math.min(sh - dp(70), toolbarY));
+        snapToolbarToEdge();
+        if (displayView != null) displayView.invalidate();
+        savePreferences();
+    }
+
     private Notification buildNotification() {
         Intent open = new Intent(this, MainActivity.class);
         PendingIntent op = PendingIntent.getActivity(this, 1, open,
@@ -633,8 +803,8 @@ public class OverlayDrawingService extends Service {
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
 
         return new Notification.Builder(this, "screen_sketch")
-                .setContentTitle("Screen Sketch S Pen v1.4")
-                .setContentText("툴바 상시 유지 · 그림 자동복구 · PNG/PDF/PRINT")
+                .setContentTitle("Screen Sketch S Pen v1.5")
+                .setContentText((drawingEnabled ? "PEN ON" : "PEN OFF") + " · 자동저장/복구 · WORK · LASSO")
                 .setSmallIcon(R.drawable.ic_pen)
                 .setContentIntent(op)
                 .setOngoing(true)
@@ -656,6 +826,7 @@ public class OverlayDrawingService extends Service {
         store.save();
         savePreferences();
         hidePalette();
+        hidePresetPanel();
         if (wm != null) {
             if (toolbar != null) try { wm.removeView(toolbar); } catch (Exception ignored) {}
             if (inputView != null) try { wm.removeView(inputView); } catch (Exception ignored) {}

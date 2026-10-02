@@ -30,7 +30,7 @@ public class MainActivity extends Activity {
         root.setBackgroundColor(Color.rgb(248,249,252));
 
         TextView title = new TextView(this);
-        title.setText("Screen Sketch S Pen v1.4");
+        title.setText("Screen Sketch S Pen v1.5");
         title.setTextSize(26);
         title.setTextColor(Color.rgb(25,28,35));
         title.setGravity(Gravity.CENTER);
@@ -40,18 +40,18 @@ public class MainActivity extends Activity {
         TextView desc = new TextView(this);
         desc.setText(
                 "갤럭시탭 화면 위에 S펜으로 그립니다.\n\n" +
-                "• PEN ON: S펜 드로잉\n" +
-                "• PEN OFF: 툴바/그림은 유지하고 아래 앱 조작\n" +
+                "• PEN ON/OFF: 툴바/그림은 유지한 채 펜 입력만 전환\n" +
+                "• LASSO: 영역 선택 → 끌어서 이동 / 우하단 핸들로 크기조절\n" +
+                "• ★ PENS: P1~P5 즐겨찾기 (탭=적용, 길게=현재펜 저장)\n" +
+                "• LOCK: 툴바 위치 고정\n" +
+                "• ✎ 최소화: 툴바를 작은 원형 버튼으로 접기\n" +
+                "• WORK: 탭=작업파일 저장, 길게=최근 작업 불러오기\n" +
+                "• RECOVER: 최근 자동저장 상태를 한 단계씩 복구\n" +
+                "• 화면 회전 시 그림 좌표 자동 보정\n" +
                 "• S펜 측면 버튼: 누르는 동안 지우개\n" +
-                "• SAVE PNG: 현재 화면 + 주석 이미지 저장\n" +
-                "• SAVE PDF: 현재 화면 + 주석 PDF 저장\n" +
-                "• PRINT: 시스템 인쇄 / PDF 저장\n\n" +
-                "자동 보존:\n" +
-                "• PEN OFF로 바꿔도 툴바와 그림 유지\n" +
-                "• 서비스가 재시작돼도 마지막 그림 자동 복원\n\n" +
-                "완전 종료:\n" +
-                "• 빨간 EXIT APP을 두 번 눌러 종료\n" +
-                "• 알림창에서도 '앱 완전 종료' 가능");
+                "• PNG/PDF/PRINT 지원\n\n" +
+                "자동 보존: 그림·펜 설정·툴바 위치·PEN 상태를 저장합니다.\n" +
+                "완전 종료는 빨간 EXIT APP을 두 번 눌렀을 때만 실행됩니다.");
         desc.setTextSize(16);
         desc.setTextColor(Color.DKGRAY);
         desc.setPadding(0, dp(22), 0, dp(26));
@@ -107,7 +107,7 @@ public class MainActivity extends Activity {
         Intent intent = new Intent(this, OverlayDrawingService.class);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent);
         else startService(intent);
-        Toast.makeText(this, "툴바가 유지됩니다. PEN ON/OFF로 입력만 전환하세요.", Toast.LENGTH_SHORT).show();
+        Toast.makeText(this, "툴바와 그림은 유지됩니다. PEN ON/OFF로 입력만 전환하세요.", Toast.LENGTH_SHORT).show();
         moveTaskToBack(true);
     }
 
